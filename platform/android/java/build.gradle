@@ -20,14 +20,39 @@ allprojects {
     }
 }
 
-def binDir = "../../../bin/"
+ext {
+    sconsExt = org.gradle.internal.os.OperatingSystem.current().isWindows() ? ".bat" : ""
+
+    supportedAbis = ["armv7", "arm64v8", "x86", "x86_64"]
+    supportedTargets = ['release':"release", 'debug':"release_debug"]
+
+    defaultTarget = "debug"
+
+    // Used by gradle to specify which architecture to build for by default when running './gradlew build'.
+    // This command is usually used by Android Studio.
+    // If building manually on the command line, it's recommended to use the
+    // './gradlew generateGodotTemplates -Pandroid_arch=arch1,arch2,...' build command instead.
+    // The defaultAbi must be one of the {supportedAbis} values.
+    defaultAbi = "arm64v8"
+}
+
+def rootDir = "../../.."
+def binDir = "$rootDir/bin/"
+
+def ANDROID_ARCH_PROP = "android_arch"
+def BUILD_TARGET_PROP = "build_target"
+def ARGUMENT_SEPARATOR = ","
+
+def getSconsTaskName(String buildType) {
+    return "compileGodotNativeLibs" + buildType.capitalize()
+}
 
 /**
  * Copy the generated 'android_debug.apk' binary template into the Godot bin directory.
  * Depends on the app build task to ensure the binary is generated prior to copying.
  */
 task copyDebugBinaryToBin(type: Copy) {
-    dependsOn ':app:build'
+    dependsOn ':app:assembleDebug'
     from('app/build/outputs/apk/debug')
     into(binDir)
     include('android_debug.apk')
@@ -38,7 +63,7 @@ task copyDebugBinaryToBin(type: Copy) {
  * Depends on the app build task to ensure the binary is generated prior to copying.
  */
 task copyReleaseBinaryToBin(type: Copy) {
-    dependsOn ':app:build'
+    dependsOn ':app:assembleRelease'
     from('app/build/outputs/apk/release')
     into(binDir)
     include('android_release.apk')
@@ -49,7 +74,7 @@ task copyReleaseBinaryToBin(type: Copy) {
  * Depends on the library build task to ensure the AAR file is generated prior to copying.
  */
 task copyDebugAAR(type: Copy) {
-    dependsOn ':lib:build'
+    dependsOn ':lib:assembleDebug'
     from('lib/build/outputs/aar')
     into('app/libs/debug')
     include('godot-lib.debug.aar')
@@ -60,7 +85,7 @@ task copyDebugAAR(type: Copy) {
  * Depends on the library build task to ensure the AAR file is generated prior to copying.
  */
 task copyReleaseAAR(type: Copy) {
-    dependsOn ':lib:build'
+    dependsOn ':lib:assembleRelease'
     from('lib/build/outputs/aar')
     into('app/libs/release')
     include('godot-lib.release.aar')
@@ -72,24 +97,120 @@ task copyReleaseAAR(type: Copy) {
  * The zip file also includes some gradle tools to allow building of the custom build.
  */
 task zipCustomBuild(type: Zip) {
-    dependsOn 'copyDebugAAR'
-    dependsOn 'copyReleaseAAR'
+    dependsOn ':generateGodotTemplates'
+    doFirst {
+        logger.lifecycle("Generating Godot custom build template")
+    }
     from(fileTree(dir: 'app', excludes: ['**/build/**', '**/.gradle/**', '**/*.iml']), fileTree(dir: '.', includes: ['gradle.properties','gradlew', 'gradlew.bat', 'gradle/**']))
     include '**/*'
     archiveName 'android_source.zip'
     destinationDir(file(binDir))
 }
 
+task('parseArgs') {
+    doLast {
+        // Check for the arch argument.
+        def androidAbis = [defaultAbi]
+        if (rootProject.hasProperty(ANDROID_ARCH_PROP)) {
+            androidAbis = rootProject.getProperties()[ANDROID_ARCH_PROP].split(ARGUMENT_SEPARATOR)
+        } else {
+            logger.warn("No $ANDROID_ARCH_PROP argument specified. Defaulting to $androidAbis")
+        }
+
+        androidAbis = androidAbis.collect { it.toLowerCase() }
+        // Validate the android abi argument.
+        for (String abi : androidAbis) {
+            if (!supportedAbis.contains(abi)) {
+                throw new GradleException("Invalid $ANDROID_ARCH_PROP argument: $abi")
+            }
+        }
+
+        // Check for the build_target argument.
+        def buildTargets = [defaultTarget]
+        if (rootProject.hasProperty(BUILD_TARGET_PROP)) {
+            buildTargets = rootProject.getProperties()[BUILD_TARGET_PROP].split(ARGUMENT_SEPARATOR)
+        } else {
+            logger.warn("No $BUILD_TARGET_PROP argument specified. Defaulting to $buildTargets")
+        }
+
+        buildTargets = buildTargets.collect { it.toLowerCase() }
+        // Validate the build target argument.
+        for (String target : buildTargets) {
+            if (!supportedTargets.containsKey(target)) {
+                throw new GradleException("Invalid $BUILD_TARGET_PROP argument: $target")
+            }
+        }
+
+        logger.lifecycle("Generating Godot build templates for $ANDROID_ARCH_PROP $androidAbis and $BUILD_TARGET_PROP $buildTargets")
+
+        // Run the scons commands
+        for (String abi : androidAbis) {
+            for (String target : buildTargets) {
+                logger.lifecycle("Running scons for target $target and android_arch $abi")
+                exec {
+                    workingDir rootDir
+                    executable "scons" + sconsExt
+                    args "platform=android", "target=${target}", "android_arch=${abi}", "-j" + Runtime.runtime.availableProcessors()
+                }
+            }
+        }
+    }
+}
+
 /**
  * Master task used to coordinate the tasks defined above to generate the set of Godot templates.
  */
 task generateGodotTemplates(type: GradleBuild) {
+    if (rootProject.hasProperty(ANDROID_ARCH_PROP)) {
+        startParameter.projectProperties[(ANDROID_ARCH_PROP)] = rootProject.getProperties()[ANDROID_ARCH_PROP]
+    }
+
+    def buildTargetArg = defaultTarget
+    if (rootProject.hasProperty(BUILD_TARGET_PROP)) {
+        buildTargetArg = rootProject.getProperties()[BUILD_TARGET_PROP]
+    }
+    startParameter.projectProperties[(BUILD_TARGET_PROP)] = buildTargetArg
+
+    // We exclude the gradle tasks so we can run the scons command 'manually' based on the given arguments.
+    for (String buildType : supportedTargets.keySet()) {
+        startParameter.excludedTaskNames += ":lib:" + getSconsTaskName(buildType)
+    }
+
     tasks = [
-            // Copy the generated aar library files to the custom build directory.
-            'copyDebugAAR', 'copyReleaseAAR',
-            // Zip the custom build directory.
-            'zipCustomBuild',
-            // Copy the prebuilt binary templates to the bin directory.
-            'copyDebugBinaryToBin', 'copyReleaseBinaryToBin',
+            // Parse the arguments and run the scons commands to generate the native libs.
+            'parseArgs',
     ]
+
+    // Parse the build target arg to figure out which tasks to schedule.
+    def buildTargets = buildTargetArg.split(ARGUMENT_SEPARATOR).collect {it.toLowerCase()}
+    for (String buildTarget : buildTargets) {
+        // Copy the generated aar library files to the custom build directory.
+        tasks += "copy" + buildTarget.capitalize() + "AAR"
+        // Copy the prebuilt binary templates to the bin directory.
+        tasks += "copy" + buildTarget.capitalize() + "BinaryToBin"
+    }
+
+    finalizedBy 'zipCustomBuild'
+}
+
+/**
+ * Clean the generated artifacts.
+ */
+task cleanGodotTemplates(type: Delete) {
+	// Delete the generated native libs
+	delete(file("lib/libs").listFiles())
+
+	// Delete the library generated AAR files
+	delete("lib/build/outputs/aar")
+
+	// Delete the app libs directory contents
+	delete(file("app/libs").listFiles())
+
+	// Delete the generated binary apks
+	delete("app/build/outputs/apk")
+
+	// Delete the Godot templates in the Godot bin directory
+	delete("$binDir/android_debug.apk")
+	delete("$binDir/android_release.apk")
+	delete("$binDir/android_source.zip")
 }
